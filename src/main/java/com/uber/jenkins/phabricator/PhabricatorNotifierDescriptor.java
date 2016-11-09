@@ -62,7 +62,7 @@ public final class PhabricatorNotifierDescriptor extends BuildStepDescriptor<Pub
      * This human readable name is used in the configuration screen.
      */
     public String getDisplayName() {
-        return "Post to Phabricator";
+        return "Post to Phabricator (Simple)";
     }
 
     @SuppressWarnings("unused")

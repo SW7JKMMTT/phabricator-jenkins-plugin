@@ -35,27 +35,28 @@ import com.uber.jenkins.phabricator.uberalls.UberallsClient;
 import com.uber.jenkins.phabricator.unit.UnitTestProvider;
 import com.uber.jenkins.phabricator.utils.CommonUtils;
 import com.uber.jenkins.phabricator.utils.Logger;
+import hudson.AbortException;
 import hudson.EnvVars;
+import hudson.FilePath;
 import hudson.Launcher;
-import hudson.model.AbstractBuild;
-import hudson.model.BuildListener;
-import hudson.model.Job;
-import hudson.model.Result;
+import hudson.model.*;
 import hudson.tasks.BuildStepMonitor;
 import hudson.tasks.Notifier;
 import jenkins.model.CauseOfInterruption;
 import jenkins.model.InterruptedBuildAction;
 import jenkins.model.Jenkins;
+import jenkins.tasks.SimpleBuildStep;
 import org.apache.commons.io.FilenameUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 
+import javax.annotation.Nonnull;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-public class PhabricatorNotifier extends Notifier {
+public class PhabricatorNotifier extends Notifier implements SimpleBuildStep {
     public static final String COBERTURA_CLASS_NAME = "com.uber.jenkins.phabricator.coverage.CoberturaCoverageProvider";
 
     private static final String JUNIT_PLUGIN_NAME = "junit";
@@ -105,9 +106,11 @@ public class PhabricatorNotifier extends Notifier {
     }
 
     @Override
-    public final boolean perform(final AbstractBuild<?, ?> build, final Launcher launcher,
-                                 final BuildListener listener) throws InterruptedException, IOException {
-        EnvVars environment = build.getEnvironment(listener);
+    public void perform(@Nonnull Run<?, ?> run,
+        @Nonnull FilePath filePath,
+        @Nonnull Launcher launcher,
+        @Nonnull TaskListener listener) throws InterruptedException, IOException {
+        EnvVars environment = run.getEnvironment(listener);
         Logger logger = new Logger(listener.getLogger());
 
         final String branch = environment.get("GIT_BRANCH");
@@ -115,20 +118,20 @@ public class PhabricatorNotifier extends Notifier {
 
         final UberallsClient uberallsClient = getUberallsClient(logger, gitUrl, branch);
 
-        final boolean needsDecoration = build.getActions(PhabricatorPostbuildAction.class).size() == 0;
+        final boolean needsDecoration = run.getActions(PhabricatorPostbuildAction.class).size() == 0;
 
         final String diffID = environment.get(PhabricatorPlugin.DIFFERENTIAL_ID_FIELD);
         final String phid = environment.get(PhabricatorPlugin.PHID_FIELD);
         final boolean isDifferential = !CommonUtils.isBlank(diffID);
 
-        InterruptedBuildAction action = build.getAction(InterruptedBuildAction.class);
+        InterruptedBuildAction action = run.getAction(InterruptedBuildAction.class);
         if (action != null) {
             List<CauseOfInterruption> causes = action.getCauses();
             for (CauseOfInterruption cause : causes) {
                 if (cause instanceof PhabricatorCauseOfInterruption) {
                     logger.warn(ABORT_TAG, "Skipping notification step since this build was interrupted"
                             + " by a newer build with the same differential revision");
-                    return true;
+                    return;
                 }
             }
         }
@@ -141,10 +144,10 @@ public class PhabricatorNotifier extends Notifier {
         // So only skip build result processing if both are blank (e.g. master runs to update coverage data)
         if (CommonUtils.isBlank(phid) && !isDifferential) {
             if (needsDecoration) {
-                build.addAction(PhabricatorPostbuildAction.createShortText(branch, null));
+                run.addAction(PhabricatorPostbuildAction.createShortText(branch, null));
             }
 
-            coverageProvider = getCoverageProvider(build, listener, Collections.<String>emptySet());
+            coverageProvider = getCoverageProvider(run, listener, filePath, Collections.<String>emptySet());
             CodeCoverageMetrics coverageResult = null;
             if (coverageProvider != null) {
                 coverageResult = coverageProvider.getMetrics();
@@ -160,16 +163,16 @@ public class PhabricatorNotifier extends Notifier {
 
             // Ignore the result.
             nonDifferentialBuildTask.run();
-            return true;
+            return;
         }
 
         ConduitAPIClient conduitClient;
         try {
-            conduitClient = getConduitClient(build.getParent());
+            conduitClient = getConduitClient(run.getParent());
         } catch (ConduitAPIException e) {
             e.printStackTrace(logger.getStream());
             logger.warn(CONDUIT_TAG, e.getMessage());
-            return false;
+            throw new AbortException();
         }
 
         final String buildUrl = environment.get("BUILD_URL");
@@ -180,10 +183,10 @@ public class PhabricatorNotifier extends Notifier {
                     logger,
                     phid,
                     conduitClient,
-                    build.getResult(),
+                    run.getResult(),
                     buildUrl
             ).run();
-            return result == Task.Result.SUCCESS;
+            return;
         }
 
         DifferentialClient diffClient = new DifferentialClient(diffID, conduitClient);
@@ -194,11 +197,11 @@ public class PhabricatorNotifier extends Notifier {
             e.printStackTrace(logger.getStream());
             logger.warn(CONDUIT_TAG, "Unable to fetch differential from Conduit API");
             logger.warn(CONDUIT_TAG, e.getMessage());
-            return true;
+            return;
         }
 
         if (needsDecoration) {
-            diff.decorate(build, this.getPhabricatorURL(build.getParent()));
+            diff.decorate(run, this.getPhabricatorURL(run.getParent()));
         }
 
         Set<String> includeFileNames = new HashSet<String>();
@@ -206,7 +209,7 @@ public class PhabricatorNotifier extends Notifier {
             includeFileNames.add(FilenameUtils.getName(file));
         }
 
-        coverageProvider = getCoverageProvider(build, listener, includeFileNames);
+        coverageProvider = getCoverageProvider(run, listener, filePath, includeFileNames);
         CodeCoverageMetrics coverageResult = null;
         if (coverageProvider != null) {
             coverageResult = coverageProvider.getMetrics();
@@ -214,7 +217,8 @@ public class PhabricatorNotifier extends Notifier {
 
         BuildResultProcessor resultProcessor = new BuildResultProcessor(
             logger,
-            build,
+            run,
+            filePath,
             diff,
             diffClient,
             environment.get(PhabricatorPlugin.PHID_FIELD),
@@ -227,7 +231,7 @@ public class PhabricatorNotifier extends Notifier {
         if (uberallsEnabled) {
             boolean passBuildOnUberalls = resultProcessor.processParentCoverage(uberallsClient);
             if (!passBuildOnUberalls && coverageCheck) {
-                build.setResult(Result.FAILURE);
+                run.setResult(Result.FAILURE);
             }
         }
 
@@ -235,7 +239,7 @@ public class PhabricatorNotifier extends Notifier {
         resultProcessor.processBuildResult(commentOnSuccess, commentWithConsoleLinkOnFailure);
 
         // Process unit tests results to send to Harbormaster
-        resultProcessor.processUnitResults(getUnitProvider(build, listener));
+        resultProcessor.processUnitResults(getUnitProvider(run, listener));
 
         // Read coverage data to send to Harbormaster
         resultProcessor.processCoverage(coverageProvider);
@@ -247,14 +251,12 @@ public class PhabricatorNotifier extends Notifier {
 
         // Fail the build if we can't report to Harbormaster
         if (!resultProcessor.processHarbormaster()) {
-            return false;
+            throw new AbortException();
         }
 
         resultProcessor.processRemoteComment(commentFile, commentSize);
 
         resultProcessor.sendComment(commentWithConsoleLinkOnFailure);
-
-        return true;
     }
 
     protected UberallsClient getUberallsClient(Logger logger, String gitUrl, String branch) {
@@ -291,36 +293,39 @@ public class PhabricatorNotifier extends Notifier {
      * @param listener The build listener
      * @return The current cobertura coverage, if any
      */
-    private CoverageProvider getCoverageProvider(AbstractBuild build, BuildListener listener,
+    private CoverageProvider getCoverageProvider(Run<?, ?> build, TaskListener listener,
+                                                 FilePath filePath,
                                                  Set<String> includeFileNames) {
-        if (!build.getResult().isBetterOrEqualTo(Result.UNSTABLE)) {
+        if (build.getResult() != null && !build.getResult().isBetterOrEqualTo(Result.UNSTABLE)) {
             return null;
         }
 
-        Logger logger = new Logger(listener.getLogger());
-        InstanceProvider<CoverageProvider> provider = new InstanceProvider<CoverageProvider>(
-                Jenkins.getInstance(),
-                COBERTURA_PLUGIN_NAME,
-                COBERTURA_CLASS_NAME,
-                logger
-        );
-        CoverageProvider coverage = provider.getInstance();
-
-        if (coverage == null) {
-            return null;
-        }
-
-        coverage.setBuild(build);
-        coverage.setIncludeFileNames(includeFileNames);
-        if (coverage.hasCoverage()) {
-            return coverage;
-        } else {
-            logger.info(UBERALLS_TAG, "No cobertura results found");
-            return null;
-        }
+        return null;
+//        Logger logger = new Logger(listener.getLogger());
+//        InstanceProvider<CoverageProvider> provider = new InstanceProvider<CoverageProvider>(
+//                Jenkins.getInstance(),
+//                COBERTURA_PLUGIN_NAME,
+//                COBERTURA_CLASS_NAME,
+//                logger
+//        );
+//        CoverageProvider coverage = provider.getInstance();
+//
+//        if (coverage == null) {
+//            return null;
+//        }
+//
+//        coverage.setPath(filePath);
+//        coverage.setBuild(build);
+//        coverage.setIncludeFileNames(includeFileNames);
+//        if (coverage.hasCoverage()) {
+//            return coverage;
+//        } else {
+//            logger.info(UBERALLS_TAG, "No cobertura results found");
+//            return null;
+//        }
     }
 
-    private UnitTestProvider getUnitProvider(AbstractBuild build, BuildListener listener) {
+    private UnitTestProvider getUnitProvider(Run<?, ?> build, TaskListener listener) {
         Logger logger = new Logger(listener.getLogger());
 
         InstanceProvider<UnitTestProvider> provider = new InstanceProvider<UnitTestProvider>(

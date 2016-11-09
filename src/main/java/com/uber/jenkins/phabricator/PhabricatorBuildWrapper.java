@@ -32,28 +32,18 @@ import com.uber.jenkins.phabricator.tasks.SendHarbormasterUriTask;
 import com.uber.jenkins.phabricator.tasks.Task;
 import com.uber.jenkins.phabricator.utils.CommonUtils;
 import com.uber.jenkins.phabricator.utils.Logger;
+import hudson.AbortException;
 import hudson.EnvVars;
+import hudson.FilePath;
 import hudson.Launcher;
-import hudson.model.AbstractBuild;
-import hudson.model.BuildListener;
-import hudson.model.Cause;
-import hudson.model.CauseAction;
-import hudson.model.Executor;
-import hudson.model.Job;
-import hudson.model.ParameterValue;
-import hudson.model.ParametersAction;
-import hudson.model.Result;
-import hudson.model.Run;
-import hudson.tasks.BuildWrapper;
+import hudson.model.*;
 import hudson.util.RunList;
-
+import jenkins.tasks.SimpleBuildWrapper;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
 
-public class PhabricatorBuildWrapper extends BuildWrapper {
+public class PhabricatorBuildWrapper extends SimpleBuildWrapper {
     private static final String CONDUIT_TAG = "conduit";
     private static final String DEFAULT_GIT_PATH = "git";
     private static final String DIFFERENTIAL_SUMMARY = "PHABRICATOR_DIFFERENTIAL_SUMMARY";
@@ -78,36 +68,36 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
         this.patchWithForceFlag = patchWithForceFlag;
     }
 
-    /** {@inheritDoc} */
     @Override
-    public Environment setUp(AbstractBuild build,
-                             Launcher launcher,
-                             BuildListener listener) throws IOException, InterruptedException {
-        EnvVars environment = build.getEnvironment(listener);
-        Logger logger = new Logger(listener.getLogger());
+    public void setUp(Context context,
+        Run<?, ?> run,
+        FilePath filePath,
+        Launcher launcher,
+        TaskListener taskListener,
+        EnvVars environment) throws IOException, InterruptedException {
+        Logger logger = new Logger(taskListener.getLogger());
         if (environment == null) {
-            return this.ignoreBuild(logger, "No environment variables found?!");
+            logger.info("ignore-build", "No environment variables found?!");
+            return;
         }
-
-        final Map<String, String> envAdditions = new HashMap<String, String>();
 
         String phid = environment.get(PhabricatorPlugin.PHID_FIELD);
         String diffID = environment.get(PhabricatorPlugin.DIFFERENTIAL_ID_FIELD);
         if (CommonUtils.isBlank(diffID)) {
-            this.addShortText(build);
-            this.ignoreBuild(logger, "No differential ID found.");
-            return new Environment(){};
+            this.addShortText(run);
+            logger.info("ignore-build", "No differential ID found.");
+            return;
         }
 
-        LauncherFactory starter = new LauncherFactory(launcher, environment, listener.getLogger(), build.getWorkspace());
+        LauncherFactory starter = new LauncherFactory(launcher, environment, taskListener.getLogger(), filePath);
 
         ConduitAPIClient conduitClient;
         try {
-            conduitClient = getConduitClient(build.getParent(), logger);
+            conduitClient = getConduitClient(run.getParent(), logger);
         } catch (ConduitAPIException e) {
             e.printStackTrace(logger.getStream());
             logger.warn(CONDUIT_TAG, e.getMessage());
-            return null;
+            throw new AbortException();
         }
 
         DifferentialClient diffClient = new DifferentialClient(diffID, conduitClient);
@@ -126,19 +116,17 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
         try {
             diff = new Differential(diffClient.fetchDiff());
             diff.setCommitMessage(diffClient.getCommitMessage(diff.getRevisionID(false)));
-            diff.decorate(build, this.getPhabricatorURL(build.getParent()));
+            diff.decorate(run, this.getPhabricatorURL(run.getParent()));
 
             logger.info(CONDUIT_TAG, "Fetching differential from Conduit API");
 
-            envAdditions.put(DIFFERENTIAL_AUTHOR, diff.getAuthorEmail());
-            envAdditions.put(DIFFERENTIAL_BASE_COMMIT, diff.getBaseCommit());
-            envAdditions.put(DIFFERENTIAL_BRANCH, diff.getBranch());
-            envAdditions.put(DIFFERENTIAL_SUMMARY, diff.getCommitMessage());
+            context.env(DIFFERENTIAL_AUTHOR, diff.getAuthorEmail());
+            context.env(DIFFERENTIAL_BASE_COMMIT, diff.getBaseCommit());
+            context.env(DIFFERENTIAL_BRANCH, diff.getBranch());
+            context.env(DIFFERENTIAL_SUMMARY, diff.getCommitMessage());
         } catch (ConduitAPIException e) {
             e.printStackTrace(logger.getStream());
-            logger.warn(CONDUIT_TAG, "Unable to fetch differential from Conduit API");
-            logger.warn(CONDUIT_TAG, e.getMessage());
-            return null;
+            throw new AbortException("Unable to fetch differential from Conduit API");
         }
 
         String baseCommit = "origin/master";
@@ -146,7 +134,7 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
             baseCommit = diff.getBaseCommit();
         }
 
-        final String conduitToken = this.getConduitToken(build.getParent(), logger);
+        final String conduitToken = this.getConduitToken(run.getParent(), logger);
         Task.Result result = new ApplyPatchTask(
                 logger, starter, baseCommit, diffID, conduitToken, getArcPath(),
                 DEFAULT_GIT_PATH, createCommit, skipForcedClean, createBranch,
@@ -160,36 +148,19 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
                 // such failure, very broke
                 logger.warn("arcanist", "Unable to notify harbormaster of patch failure");
             }
-            // Indicate failure
-            return null;
+            throw new AbortException();
         }
 
-        return new Environment(){
-            @Override
-            public void buildEnvVars(Map<String, String> env) {
-                EnvVars envVars = new EnvVars(env);
-                envVars.putAll(envAdditions);
-                env.putAll(envVars);
-            }
-        };
-    }
-
-    /**
-     * Abort running builds when new build referencing same revision is scheduled to run
-     */
-    @Override
-    public void preCheckout(AbstractBuild build, Launcher launcher, BuildListener listener) throws IOException,
-            InterruptedException {
-        String abortOnRevisionId = getAbortOnRevisionId(build);
+        String abortOnRevisionId = getAbortOnRevisionId(run);
         // If ABORT_ON_REVISION_ID is available
         if (!CommonUtils.isBlank(abortOnRevisionId)) {
             // Create a cause of interruption
             PhabricatorCauseOfInterruption causeOfInterruption =
-                    new PhabricatorCauseOfInterruption(build.getUrl());
-            Run upstreamRun = getUpstreamRun(build);
+                new PhabricatorCauseOfInterruption(run.getUrl());
+            Run upstreamRun = getUpstreamRun(run);
 
             // Get the running builds that were scheduled before the current one
-            RunList<AbstractBuild> runningBuilds = (RunList<AbstractBuild>) build.getProject().getBuilds();
+            RunList<AbstractBuild> runningBuilds = (RunList<AbstractBuild>) run.getParent().getBuilds();
             for (AbstractBuild runningBuild : runningBuilds) {
                 Executor executor = runningBuild.getExecutor();
                 Run runningBuildUpstreamRun = getUpstreamRun(runningBuild);
@@ -197,12 +168,12 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
                 // Ignore builds that were triggered by the same upstream build
                 // Find builds triggered with the same ABORT_ON_REVISION_ID_FIELD
                 if (runningBuild.isBuilding()
-                        && runningBuild.number < build.number
-                        && abortOnRevisionId.equals(getAbortOnRevisionId(runningBuild))
-                        && (upstreamRun == null
-                        || runningBuildUpstreamRun == null
-                        || !upstreamRun.equals(runningBuildUpstreamRun))
-                        && executor != null) {
+                    && runningBuild.number < run.number
+                    && abortOnRevisionId.equals(getAbortOnRevisionId(runningBuild))
+                    && (upstreamRun == null
+                    || runningBuildUpstreamRun == null
+                    || !upstreamRun.equals(runningBuildUpstreamRun))
+                    && executor != null) {
                     // Abort the builds
                     executor.interrupt(Result.ABORTED, causeOfInterruption);
                 }
@@ -210,8 +181,8 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
         }
     }
 
-    private void addShortText(final AbstractBuild build) {
-        build.addAction(PhabricatorPostbuildAction.createShortText("master", null));
+    private void addShortText(final Run<?, ?> run) {
+        run.addAction(PhabricatorPostbuildAction.createShortText("master", null));
     }
 
     private Environment ignoreBuild(Logger logger, String message) {
@@ -287,8 +258,8 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
     }
 
     @VisibleForTesting
-    static String getAbortOnRevisionId(AbstractBuild build) {
-        ParametersAction parameters = build.getAction(ParametersAction.class);
+    static String getAbortOnRevisionId(Run<?, ?> run) {
+        ParametersAction parameters = run.getAction(ParametersAction.class);
         if (parameters != null) {
             ParameterValue parameterValue = parameters.getParameter(
                     PhabricatorPlugin.ABORT_ON_REVISION_ID_FIELD);
@@ -300,10 +271,10 @@ public class PhabricatorBuildWrapper extends BuildWrapper {
     }
 
     @VisibleForTesting
-    static Run<?, ?> getUpstreamRun(AbstractBuild build) {
-        CauseAction action = build.getAction(hudson.model.CauseAction.class);
+    static Run<?, ?> getUpstreamRun(Run<?, ?> build) {
+        CauseAction action = build.getAction(CauseAction.class);
         if (action != null) {
-            Cause.UpstreamCause upstreamCause = action.findCause(hudson.model.Cause.UpstreamCause.class);
+            Cause.UpstreamCause upstreamCause = action.findCause(Cause.UpstreamCause.class);
             if (upstreamCause != null) {
                 return upstreamCause.getUpstreamRun();
             }

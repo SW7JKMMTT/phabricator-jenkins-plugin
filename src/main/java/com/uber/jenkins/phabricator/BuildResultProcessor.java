@@ -37,19 +37,16 @@ import com.uber.jenkins.phabricator.unit.UnitTestProvider;
 import com.uber.jenkins.phabricator.utils.CommonUtils;
 import com.uber.jenkins.phabricator.utils.Logger;
 import hudson.FilePath;
-import hudson.model.AbstractBuild;
 import hudson.model.Result;
+import hudson.model.Run;
 import net.sf.json.JSONException;
 import net.sf.json.JSONObject;
-import org.apache.commons.io.FilenameUtils;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.StringReader;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public class BuildResultProcessor {
 
@@ -70,9 +67,9 @@ public class BuildResultProcessor {
     private LintResults lintResults;
 
     public BuildResultProcessor(
-            Logger logger, AbstractBuild build, Differential diff, DifferentialClient diffClient,
-            String phid, CodeCoverageMetrics coverageResult, String buildUrl, boolean preserveFormatting,
-            double maximumCoverageDecreaseInPercent) {
+        Logger logger, Run<?, ?> build, FilePath filePath, Differential diff, DifferentialClient diffClient,
+        String phid, CodeCoverageMetrics coverageResult, String buildUrl, boolean preserveFormatting,
+        double maximumCoverageDecreaseInPercent) {
         this.logger = logger;
         this.diff = diff;
         this.diffClient = diffClient;
@@ -80,7 +77,7 @@ public class BuildResultProcessor {
         this.buildUrl = buildUrl;
 
         this.buildResult = build.getResult();
-        this.workspace = build.getWorkspace();
+        this.workspace = filePath;
 
         this.commentAction = "none";
         this.commenter = new CommentBuilder(logger, build.getResult(), coverageResult, buildUrl, preserveFormatting,
@@ -185,7 +182,7 @@ public class BuildResultProcessor {
             return;
         }
 
-        if (commentWithConsoleLinkOnFailure && buildResult.isWorseOrEqualTo(hudson.model.Result.UNSTABLE)) {
+        if (commentWithConsoleLinkOnFailure && (buildResult != null && buildResult.isWorseOrEqualTo(hudson.model.Result.UNSTABLE))) {
             commenter.addBuildFailureMessage();
         } else {
             commenter.addBuildLink();
@@ -200,7 +197,7 @@ public class BuildResultProcessor {
      * @return whether we were able to successfully send the result
      */
     public boolean processHarbormaster() {
-        final boolean harbormasterSuccess = buildResult.isBetterOrEqualTo(Result.SUCCESS);
+        final boolean harbormasterSuccess = buildResult == null || buildResult.isBetterOrEqualTo(Result.SUCCESS);
 
         if (runHarbormaster) {
             logger.info("harbormaster", "Sending Harbormaster BUILD_URL via PHID: " + phid);

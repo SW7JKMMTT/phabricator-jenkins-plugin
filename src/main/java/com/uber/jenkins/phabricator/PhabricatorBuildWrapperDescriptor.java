@@ -52,7 +52,7 @@ public final class PhabricatorBuildWrapperDescriptor extends BuildWrapperDescrip
      * This human readable name is used in the configuration screen.
      */
     public String getDisplayName() {
-        return "Apply Phabricator Differential";
+        return "Apply Phabricator Differential (Simple)";
     }
 
     @SuppressWarnings("unused")

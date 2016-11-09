@@ -108,7 +108,7 @@ class CommentBuilder {
     }
 
     public void processBuildResult(boolean commentOnSuccess, boolean commentWithConsoleLinkOnFailure, boolean runHarbormaster) {
-        if (result == Result.SUCCESS) {
+        if (result == null || result == Result.SUCCESS) {
             if (comment.length() == 0 && (commentOnSuccess || !runHarbormaster)) {
                 comment.append("Build is green");
             }

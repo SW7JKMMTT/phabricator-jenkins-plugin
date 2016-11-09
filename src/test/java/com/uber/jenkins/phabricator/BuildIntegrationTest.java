@@ -65,8 +65,10 @@ public abstract class BuildIntegrationTest {
     }
 
     void assertSuccessfulBuild(Result result) {
-        assertTrue(result.isCompleteBuild());
-        assertTrue(result.isBetterOrEqualTo(Result.SUCCESS));
+        if (result != null) { //Supposedly null means success in recent versions.
+            assertTrue(result.isCompleteBuild());
+            assertTrue(result.isBetterOrEqualTo(Result.SUCCESS));
+        }
     }
 
     FreeStyleProject createProject() throws IOException {
